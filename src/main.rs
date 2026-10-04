@@ -1,9 +1,9 @@
 use std::{collections::HashMap, io, process};
 
 use backtrace::Backtrace;
-use serde_json::{json, Result};
+use serde_json::{json, Result, Value};
 
-use jsonschema::{Draft, Retrieve, Uri};
+use jsonschema::{Draft, Evaluation, Retrieve, Uri, Validator};
 
 struct InMemoryRetriever {
     registry: serde_json::Value,
@@ -15,6 +15,55 @@ impl Retrieve for InMemoryRetriever {
         uri: &Uri<String>,
     ) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.registry[uri.as_str()].to_owned())
+    }
+}
+
+fn keyword_of(schema_location: &str) -> (String, &str) {
+    let fragment = schema_location
+        .split_once('#')
+        .map_or(schema_location, |(_, fragment)| fragment);
+    let keyword = fragment.rsplit('/').next().unwrap_or_default();
+    (format!("#{fragment}"), keyword)
+}
+
+fn annotations(evaluation: &Evaluation) -> Vec<Value> {
+    let mut annotations = vec![];
+    for entry in evaluation.iter_annotations() {
+        let (keyword_location, keyword) = keyword_of(entry.schema_location);
+        let annotation = entry.annotations.value();
+        let instance_location = entry.instance_location.as_str();
+
+        match annotation.as_object() {
+            Some(collected) if keyword != "contentSchema" => {
+                annotations.extend(collected.iter().map(|(keyword, annotation)| {
+                    json!({
+                        "keyword": keyword,
+                        "instanceLocation": instance_location,
+                        "keywordLocation": format!("{keyword_location}/{keyword}"),
+                        "annotation": annotation,
+                    })
+                }))
+            }
+            _ => annotations.push(json!({
+                "keyword": keyword,
+                "instanceLocation": instance_location,
+                "keywordLocation": keyword_location,
+                "annotation": annotation,
+            })),
+        }
+    }
+    annotations
+}
+
+fn test_result(compiled: &Validator, instance: &Value, output: &str) -> Value {
+    if output == "annotations" {
+        let evaluation = compiled.evaluate(instance);
+        json!({
+            "valid": evaluation.flag().valid,
+            "annotations": annotations(&evaluation),
+        })
+    } else {
+        json!({"valid": compiled.is_valid(instance)})
     }
 }
 
@@ -103,11 +152,15 @@ fn main() -> Result<()> {
 
                 let response = match options.build(&case["schema"]) {
                     Ok(compiled) => {
+                        let output = request
+                            .get("output")
+                            .and_then(Value::as_str)
+                            .unwrap_or("flag");
                         let results: Vec<_> = case["tests"]
                             .as_array()
                             .expect("Invalid tests!")
                             .iter()
-                            .map(|test| json!({"valid": compiled.is_valid(&test["instance"])}))
+                            .map(|test| test_result(&compiled, &test["instance"], output))
                             .collect();
                         json!({"seq": &request["seq"], "results": &results})
                     }
